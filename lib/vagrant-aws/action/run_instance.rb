@@ -69,7 +69,6 @@ module VagrantPlugins
           if subnet_id and not elastic_ip and not allocate_elastic_ip
             env[:ui].warn(I18n.t("vagrant_aws.launch_vpc_warning"))
           end
-
           # Launch!
           env[:ui].info(I18n.t("vagrant_aws.launching_instance"))
           env[:ui].info(" -- Type: #{instance_type}")
@@ -104,11 +103,11 @@ module VagrantPlugins
             :user_data                 => user_data,
             :elastic_ip                => elastic_ip,
             :allocate_elastic_ip       => allocate_elastic_ip,
-            :block_device_mapping      => block_device_mapping,
             :instance_initiated_shutdown_behavior => terminate_on_shutdown == true ? "terminate" : nil,
             :monitoring                => monitoring,
             :ebs_optimized             => ebs_optimized
           }
+          options = process_block_device_options(options, block_device_mapping)
           if !security_groups.empty?
             security_group_key = options[:subnet_id].nil? ? :groups : :security_group_ids
             options[security_group_key] = security_groups
@@ -117,6 +116,7 @@ module VagrantPlugins
           begin
             env[:ui].warn(I18n.t("vagrant_aws.warn_ssh_access")) unless allows_ssh_port?(env, security_groups, subnet_id)
 
+            @logger.info("---------------------- All Options - #{options}---------------")
             server = env[:aws_compute].servers.create(options)
           rescue Fog::Compute::AWS::NotFound => e
             # Invalid subnet doesn't have its own error so we catch and
@@ -138,6 +138,7 @@ module VagrantPlugins
           # Immediately save the ID since it is created at this point.
           env[:machine].id = server.id
 
+                   
           # Wait for the instance to be ready first
           env[:metrics]["instance_ready_time"] = Util::Timer.time do
             tries = region_config.instance_ready_timeout / 2
@@ -149,7 +150,7 @@ module VagrantPlugins
                 next if env[:interrupted]
 
                 # Wait for the server to be ready
-                server.wait_for(2) { ready? }
+                server.wait_for(3) { ready? }
               end
             rescue Fog::Errors::TimeoutError
               # Delete the instance
@@ -162,6 +163,23 @@ module VagrantPlugins
           end
 
           @logger.info("Time to instance ready: #{env[:metrics]["instance_ready_time"]}")
+
+          # Create and attach ebs volume if present
+          if not ebs_volumes(block_device_mapping).empty?
+            @logger.info("creating and attaching ebs volume")
+            ebs_volumes(block_device_mapping).each do |ebs_vol|
+              vol_options = build_volume_options(ebs_vol,server.availability_zone)
+              begin
+                @logger.info("VOL OPTIONS - #{vol_options}")
+                volume = env[:aws_compute].volumes.create(vol_options)
+                @logger.info("------------------- v - #{volume.inspect} ----------------")
+                tries = region_config.instance_ready_timeout / 2
+                attach_volume_to_server(env[:aws_compute],volume.id,server.id,ebs_vol['DeviceName'],tries)
+              rescue Fog::Compute::AWS::Error => e
+                raise Errors::FogError, :message => e.message
+              end
+            end
+          end
 
           # Allocate and associate an elastic IP if requested
           #if elastic_ip
@@ -301,6 +319,52 @@ module VagrantPlugins
             end
             raise
           end
+        end
+        
+        def process_block_device_options(options,block_devices)
+          ephemeral_devices = block_devices - ebs_volumes(block_devices)
+          if not ephemeral_devices.empty?
+            options[:block_device_mapping] = block_device_mapping
+          end
+          options
+        end
+
+        def build_volume_options(ebs_vol,availability_zone)
+          volume_options = {}
+          volume_options[:device] = ebs_vol['DeviceName'] || '/dev/sdf'
+          volume_options[:tags] = {'Name' => ebs_vol['VirtualName']} if ebs_vol.has_key?('VirtualName')
+          volume_options[:size] = ebs_vol['Ebs.VolumeSize'] || raise("EBS Volume size not specified")
+          volume_options[:availability_zone] = availability_zone
+          volume_options[:delete_on_termination] = ebs_vol['Ebs.DeleteOnTermination'] || true
+          volume_options[:type] = ebs_vol['Ebs.VolumeType'] if ebs_vol.has_key?('Ebs.VolumeType')
+          volume_options[:iops] = ebs_vol['Ebs.Iops'] if ebs_vol.has_key?('Ebs.Iops')
+          volume_options
+        end
+              
+        def ebs_volumes(block_devices) 
+          block_devices.select { |block_device| block_device.has_key?('Ebs.VolumeSize') or block_device.has_key?('Ebs.VolumeType') }
+        end
+
+        def attach_volume_to_server(connection,volume_id,server_id,device,tries)
+          try = 0
+          while try < tries do
+            sleep(5)
+            break if connection.volumes.find{ |vol| vol.id == volume_id}.state == 'available'
+            try = try + 1
+          end
+          raise_error("Taking too long to create volume with id #{volume_id}") if try == tries
+          output = connection.attach_volume(server_id,volume_id,device)
+          try = 0
+          while try < tries do 
+            break if connection.volumes.find{ |vol| vol.id == volume_id}.state == 'in-use'
+            try = try + 1
+          end          
+          raise_error("Unable to attach volume #{volume_id} as device #{device} to server #{server_id}") if try == tries
+        end
+
+        def raise_error(error_message)
+          raise Errors::FogError,
+                  :message => error_message
         end
 
         def control_vm_creation
