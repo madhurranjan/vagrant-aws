@@ -324,7 +324,7 @@ module VagrantPlugins
         def process_block_device_options(options,block_devices)
           ephemeral_devices = block_devices - ebs_volumes(block_devices)
           if not ephemeral_devices.empty?
-            options[:block_device_mapping] = block_device_mapping
+            options[:block_device_mapping] = block_devices
           end
           options
         end
