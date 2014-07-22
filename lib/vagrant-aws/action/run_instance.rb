@@ -11,7 +11,7 @@ module VagrantPlugins
       # This runs the configured instance.
       class RunInstance
         @@instances = 0
-        LIMIT = 10
+        LIMIT = 9
         
         def self.update_instances
           @@instances = @@instances + 1
